@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 from torch import device, nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets
 from torch.utils.tensorboard import SummaryWriter
 
@@ -76,37 +76,23 @@ class LightweightCNN(nn.Module):
 def create_model_rgb(num_classes):
     return LightweightCNN(3, num_classes)
 
-def create_model_gray(num_classes):
-    return LightweightCNN(1, num_classes)
-
 def create_model_single_channel(num_classes):
     return LightweightCNN(1, num_classes)
 
-class CustomCombineChannel(object):
-    def __init__(self, power_r, power_g, power_b):
-        self.power_r = power_r
-        self.power_g = power_g
-        self.power_b = power_b
+class LinearCombineChannel(object):
+    def __init__(self, w_r, w_g, w_b):
+        self.w_r = w_r
+        self.w_g = w_g
+        self.w_b = w_b
 
     def __call__(self, img):
-        # img shape is [3, H, W] after ToTensor() in the range [0, 1]
-        img_255 = img * 255.0
-        r = img_255[0]
-        g = img_255[1]
-        b = img_255[2]
-        
-        combined = (r ** self.power_r) + (g ** self.power_g) + (b ** self.power_b)
-        log_combined = torch.log(combined + 1e-7)
-        normalized = log_combined / torch.log(torch.tensor(16646655.0))
-        return normalized.unsqueeze(0)
+        r = img[0]
+        g = img[1]
+        b = img[2]
+        combined = self.w_r * r + self.w_g * g + self.w_b * b
+        return combined.unsqueeze(0)
 
-class ExtractChannel(object):
-    def __init__(self, channel):
-        self.channel = channel
-    def __call__(self, img):
-        return img[self.channel:self.channel+1, :, :]
-
-def create_dataloaders(transform, batch_size, num_workers):
+def create_dataloaders(transform, batch_size, num_workers, subset_per_class=None):
     data_dir = 'data'
     cifar_path = os.path.join(data_dir, 'cifar-10-batches-py')
     needs_download = not os.path.exists(cifar_path)
@@ -114,10 +100,27 @@ def create_dataloaders(transform, batch_size, num_workers):
     train_dataset = datasets.CIFAR10(root=data_dir, train=True, download=needs_download, transform=transform)
     test_dataset = datasets.CIFAR10(root=data_dir, train=False, download=needs_download, transform=transform)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,persistent_workers=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,persistent_workers=True)
+    if subset_per_class is not None:
+        indices = []
+        targets = np.array(train_dataset.targets)
+        for i in range(len(train_dataset.classes)):
+            class_indices = np.where(targets == i)[0][:subset_per_class]
+            indices.extend(class_indices)
+        train_dataset = Subset(train_dataset, indices)
+        
+        # Also subset test set for maximum speed during evaluation
+        test_indices = []
+        test_targets = np.array(test_dataset.targets)
+        for i in range(len(test_dataset.classes)):
+            test_indices.extend(np.where(test_targets == i)[0][:subset_per_class])
+        test_dataset = Subset(test_dataset, test_indices)
     
-    return train_loader, test_loader, train_dataset.classes
+    pw = True if num_workers > 0 else False
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, persistent_workers=pw)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=pw)
+    
+    classes = train_dataset.dataset.classes if isinstance(train_dataset, Subset) else train_dataset.classes
+    return train_loader, test_loader, classes
 
 def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
     model.train()
@@ -155,17 +158,21 @@ def evaluate(model, dataloader, loss_fn, device):
             total += y.size(0)
     return running_loss / total, correct / total
 
-def run_training(model, train_loader, test_loader, log_dir, device, image_size=32, epochs=5):
+def run_training(model, train_loader, test_loader,log_dir,device, image_size=32, epochs=2):
     model = model.to(device)
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
     writer = SummaryWriter(log_dir=log_dir)
     try:
         dummy = torch.randn(1, *([3, image_size, image_size] if next(model.parameters()).shape[1]==3 else [1, image_size, image_size])).to(device)
         writer.add_graph(model, dummy)
     except Exception as e:
         pass
+
+
     for epoch in range(epochs):
+        
         train_loss, train_acc = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
         test_loss, test_acc = evaluate(model, test_loader, loss_fn, device)
         writer.add_scalar('train/loss', train_loss, epoch)
@@ -174,18 +181,3 @@ def run_training(model, train_loader, test_loader, log_dir, device, image_size=3
         writer.add_scalar('test/acc', test_acc, epoch)
     writer.close()
     return model, test_acc
-
-
-class UltraTinyCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.conv = nn.Conv2d(1, 2, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(2, 10)
-
-    def forward(self, x):
-        x = torch.relu(self.conv(x))
-        x = self.pool(x)
-        x = x.flatten(1)
-        return self.fc(x)
