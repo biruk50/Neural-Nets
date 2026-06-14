@@ -2,6 +2,8 @@ import os
 import random
 import numpy as np
 import torch
+import copy
+
 from torch import device, nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets
@@ -11,11 +13,7 @@ def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -122,62 +120,153 @@ def create_dataloaders(transform, batch_size, num_workers, subset_per_class=None
     classes = train_dataset.dataset.classes if isinstance(train_dataset, Subset) else train_dataset.classes
     return train_loader, test_loader, classes
 
+
 def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
     model.train()
+
     running_loss = 0.0
     correct = 0
     total = 0
+
     for X, y in dataloader:
-        X, y = X.to(device), y.to(device)
-        
-        optimizer.zero_grad()
+        X = X.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
         preds = model(X)
         loss = loss_fn(preds, y)
+
         loss.backward()
         optimizer.step()
-        
+
         running_loss += loss.item() * X.size(0)
-        _, predicted = torch.max(preds, 1)
+
+        predicted = preds.argmax(dim=1)
         correct += (predicted == y).sum().item()
         total += y.size(0)
-    return running_loss / total, correct / total
+
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+
+    return epoch_loss, epoch_acc
+
 
 def evaluate(model, dataloader, loss_fn, device):
     model.eval()
+
     running_loss = 0.0
     correct = 0
     total = 0
+
     with torch.inference_mode():
         for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
+            X = X.to(device)
+            y = y.to(device)
+
             preds = model(X)
             loss = loss_fn(preds, y)
+
             running_loss += loss.item() * X.size(0)
-            _, predicted = torch.max(preds, 1)
+
+            predicted = preds.argmax(dim=1)
             correct += (predicted == y).sum().item()
             total += y.size(0)
-    return running_loss / total, correct / total
 
-def run_training(model, train_loader, test_loader,log_dir,device, image_size=32, epochs=2):
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+
+    return epoch_loss, epoch_acc
+
+
+def run_training(
+    model,
+    train_loader,
+    test_loader,
+    log_dir,
+    device,
+    image_size=32,
+    epochs=10,
+    patience=2,
+):
     model = model.to(device)
+
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3,
+    )
+
     writer = SummaryWriter(log_dir=log_dir)
+
     try:
-        dummy = torch.randn(1, *([3, image_size, image_size] if next(model.parameters()).shape[1]==3 else [1, image_size, image_size])).to(device)
+        dummy = torch.randn(1, 3, image_size, image_size).to(device)
         writer.add_graph(model, dummy)
-    except Exception as e:
+    except Exception:
         pass
 
+    best_acc = 0.0
+    epochs_without_improvement = 0
+
+    test_loss = float("nan")
+    test_acc = float("nan")
 
     for epoch in range(epochs):
-        
-        train_loss, train_acc = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
-        test_loss, test_acc = evaluate(model, test_loader, loss_fn, device)
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('train/acc', train_acc, epoch)
-        writer.add_scalar('test/loss', test_loss, epoch)
-        writer.add_scalar('test/acc', test_acc, epoch)
-    writer.close()
-    return model, test_acc
+
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            loss_fn,
+            optimizer,
+            device,
+        )
+
+        writer.add_scalar("train/loss", train_loss, epoch)
+        writer.add_scalar("train/acc", train_acc, epoch)
+
+        should_eval = (
+            (epoch + 1) % 3 == 0
+            or epoch == epochs - 1
+        )
+
+        if should_eval:
+
+            test_loss, test_acc = evaluate(
+                model,
+                test_loader,
+                loss_fn,
+                device,
+            )
+
+            writer.add_scalar("test/loss", test_loss, epoch)
+            writer.add_scalar("test/acc", test_acc, epoch)
+
+            if test_acc > best_acc:
+                best_acc = test_acc
+                epochs_without_improvement = 0
+
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= patience:
+                print(
+                    f"Early stopping after {patience} "
+                    f"evaluation rounds without improvement."
+                )
+                break
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"Train Acc: {train_acc:.4f}")
+
+        if should_eval:
+            print(f"Validation Acc: {test_acc:.4f}")
+    
+    torch.save(
+        model.state_dict(),
+        os.path.join(log_dir, "best_model.pt")
+    )
+    
+    writer.close() 
+    return model, best_acc
