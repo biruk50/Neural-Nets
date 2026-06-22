@@ -193,11 +193,18 @@ def run_training(
 
     loss_fn = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=1e-3,
+        lr=0.1,
+        momentum=0.9,
+        weight_decay=5e-4,
     )
 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+    )
+    
     writer = SummaryWriter(log_dir=log_dir)
 
     try:
@@ -255,6 +262,8 @@ def run_training(
                     f"evaluation rounds without improvement."
                 )
                 break
+        
+        scheduler.step()
 
         print(
             f"Epoch [{epoch + 1}/{epochs}] | "
@@ -262,7 +271,7 @@ def run_training(
 
         if should_eval:
             print(f"Validation Acc: {test_acc:.4f}")
-    
+        
     torch.save(
         model.state_dict(),
         os.path.join(log_dir, "best_model.pt")
